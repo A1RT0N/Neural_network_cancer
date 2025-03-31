@@ -1,6 +1,7 @@
 import os
 import glob
 import logging
+import random
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
@@ -14,7 +15,7 @@ from PIL import Image
 
 # Set up logging
 logging.basicConfig(
-    filename='training_output_efficientnet_b7_raw.log',
+    filename='training_output_efficientnet_b7_balanced_augmented.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -24,6 +25,7 @@ SEED = 42
 torch.manual_seed(SEED)
 torch.cuda.manual_seed(SEED) if torch.cuda.is_available() else None
 np.random.seed(SEED)
+random.seed(SEED)
 
 # Configuration
 DATA_DIR = "/home/Ayrton/Neural_network_cancer"
@@ -33,27 +35,33 @@ NUM_CLASSES = 2
 NUM_EPOCHS = 100
 LEARNING_RATE = 0.0005
 WEIGHT_DECAY = 1e-5
+UNDERSAMPLE_RATIO = 0.4  # Keep 40% of majority class samples
 
 # Check if CUDA is available
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 logging.info(f"Using device: {device}")
 
-# Custom dataset class for loading images
+# Mixed precision training setup
+scaler = torch.cuda.amp.GradScaler() if torch.cuda.is_available() else None
+
+# Custom dataset class with undersampling option
 class CancerDataset(Dataset):
-    def __init__(self, data_dir, subset='Training', transform=None):
+    def __init__(self, data_dir, subset='Training', transform=None, undersample_majority=False, undersample_ratio=0.5):
         """
         Args:
             data_dir (string): Directory with all the images
             subset (string): 'Training', 'Validation', or 'Test'
             transform (callable, optional): Optional transform to be applied on a sample
+            undersample_majority (bool): Whether to undersample the majority class
+            undersample_ratio (float): What percentage of majority class to keep (0.0-1.0)
         """
         self.transform = transform
-        self.classes = ['AC', 'LSCC']  # Assuming these are the two classes
+        self.classes = ['AC', 'LSCC']  # Actinic cheilitis and Labial squamous cell carcinoma
         self.class_to_idx = {cls: i for i, cls in enumerate(self.classes)}
         
-        # Get all jpg and JPG files
-        self.image_paths = []
-        self.labels = []
+        # Get all image paths for each class
+        class_paths = {}
+        class_counts = {}
         
         for cls in self.classes:
             class_path = os.path.join(data_dir, subset, cls)
@@ -61,10 +69,36 @@ class CancerDataset(Dataset):
                 logging.warning(f"Path does not exist: {class_path}")
                 continue
                 
+            paths = []
             for img_ext in ['*.jpg', '*.JPG']:
-                paths = glob.glob(os.path.join(class_path, img_ext))
-                self.image_paths.extend(paths)
-                self.labels.extend([self.class_to_idx[cls]] * len(paths))
+                paths.extend(glob.glob(os.path.join(class_path, img_ext)))
+            
+            class_paths[cls] = paths
+            class_counts[cls] = len(paths)
+        
+        # Find majority and minority classes
+        majority_class = max(class_counts, key=class_counts.get)
+        minority_class = min(class_counts, key=class_counts.get)
+        
+        logging.info(f"Before undersampling - {majority_class}: {class_counts[majority_class]}, {minority_class}: {class_counts[minority_class]}")
+        
+        # Apply undersampling to majority class if requested (only for training set)
+        if undersample_majority and subset == 'Training':
+            # Calculate how many samples to keep from majority class
+            keep_count = int(class_counts[majority_class] * undersample_ratio)
+            # Randomly sample from majority class
+            class_paths[majority_class] = random.sample(class_paths[majority_class], keep_count)
+            class_counts[majority_class] = keep_count
+            
+            logging.info(f"After undersampling - {majority_class}: {class_counts[majority_class]}, {minority_class}: {class_counts[minority_class]}")
+        
+        # Combine all paths and labels
+        self.image_paths = []
+        self.labels = []
+        
+        for cls in self.classes:
+            self.image_paths.extend(class_paths[cls])
+            self.labels.extend([self.class_to_idx[cls]] * len(class_paths[cls]))
         
         logging.info(f"Loaded {len(self.image_paths)} images for {subset} set")
     
@@ -86,17 +120,37 @@ class CancerDataset(Dataset):
             placeholder = torch.zeros((3, INPUT_SIZE, INPUT_SIZE))
             return placeholder, label
 
-# Define data transformations - only basic resizing and normalization, no augmentation
-transform = transforms.Compose([
-    transforms.Resize((INPUT_SIZE, INPUT_SIZE)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-])
+# Define data transformations for each set
+def get_transforms(input_size, is_training=False):
+    if is_training:
+        # Strong augmentation for training (geometric transformations that preserve lesion features)
+        return transforms.Compose([
+            transforms.RandomResizedCrop(input_size, scale=(0.8, 1.0)),
+            transforms.RandomHorizontalFlip(),
+            transforms.RandomVerticalFlip(),
+            transforms.RandomRotation(15),  # Moderate rotation
+            transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.05, hue=0.0),  # Subtle color changes
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    else:
+        # Only resize and normalize for validation/test sets
+        return transforms.Compose([
+            transforms.Resize((input_size, input_size)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
 
-# Create datasets - using the same transform for all sets
-train_dataset = CancerDataset(DATA_DIR, subset='Training', transform=transform)
-val_dataset = CancerDataset(DATA_DIR, subset='Validation', transform=transform)
-test_dataset = CancerDataset(DATA_DIR, subset='Test', transform=transform)
+# Create datasets with appropriate transforms
+train_dataset = CancerDataset(
+    DATA_DIR, 
+    subset='Training', 
+    transform=get_transforms(INPUT_SIZE, is_training=True),
+    undersample_majority=True,
+    undersample_ratio=UNDERSAMPLE_RATIO
+)
+val_dataset = CancerDataset(DATA_DIR, subset='Validation', transform=get_transforms(INPUT_SIZE, is_training=False))
+test_dataset = CancerDataset(DATA_DIR, subset='Test', transform=get_transforms(INPUT_SIZE, is_training=False))
 
 # Create data loaders
 train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
@@ -113,7 +167,7 @@ def check_pretrained_weights():
         logging.info(f"Pretrained weights file found at: {weights_path}")
     return weights_path
 
-# EfficientNet B7 model with local pretrained weights
+# EfficientNet B7 model with improved fine-tuning strategy
 def get_model():
     # Initialize the model with random weights first
     model = models.efficientnet_b7(weights=None)
@@ -123,21 +177,35 @@ def get_model():
     state_dict = torch.load(pretrained_weights_path)
     model.load_state_dict(state_dict)
     
-    # Freeze initial layers to prevent overfitting
-    # B7 has more layers, so we freeze more initial layers
-    for param in list(model.parameters())[:-40]:  # Adjusted for B7
+    # Improved freezing strategy - unfreeze final layers gradually
+    # First freeze all parameters
+    for param in model.parameters():
         param.requires_grad = False
-        
-    # Replace the classifier head
+    
+    # Then unfreeze the last few feature blocks (progressive unfreezing)
+    features = list(model.features)
+    for layer in features[-4:]:  # Unfreeze the last 4 blocks
+        for param in layer.parameters():
+            param.requires_grad = True
+    
+    # Replace the classifier head with dropout for better regularization
     num_ftrs = model.classifier[1].in_features
-    model.classifier[1] = nn.Linear(num_ftrs, NUM_CLASSES)
+    model.classifier = nn.Sequential(
+        nn.Dropout(p=0.3),  # Add dropout for regularization
+        nn.Linear(num_ftrs, NUM_CLASSES)
+    )
+    
+    # Make sure classifier parameters are trainable
+    for param in model.classifier.parameters():
+        param.requires_grad = True
     
     return model.to(device)
 
-# Training function
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs):
+# Training function with early stopping and mixed precision
+def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs, patience=15):
     best_val_auc = 0.0
     best_model_wts = None
+    patience_counter = 0
     
     train_losses = []
     val_losses = []
@@ -158,14 +226,32 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             
             optimizer.zero_grad()
             
-            with torch.set_grad_enabled(True):
-                outputs = model(inputs)
-                _, preds = torch.max(outputs, 1)
-                loss = criterion(outputs, labels)
+            # Use mixed precision if available
+            if scaler:
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    loss = criterion(outputs, labels)
                 
+                # Mixed precision backward and update
+                scaler.scale(loss).backward()
+                
+                # Apply gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                # Standard precision fallback
+                outputs = model(inputs)
+                loss = criterion(outputs, labels)
                 loss.backward()
+                
+                # Apply gradient clipping
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 optimizer.step()
             
+            _, preds = torch.max(outputs, 1)
             running_loss += loss.item() * inputs.size(0)
             total += inputs.size(0)
             all_preds.extend(preds.cpu().numpy())
@@ -216,12 +302,21 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             epoch_auc = roc_auc_score(all_labels, all_probs)
             logging.info(f'Val Loss: {epoch_loss:.4f} F1: {epoch_f1:.4f} AUC: {epoch_auc:.4f}')
             
-            # Save the best model
+            # Check if this is the best model
             if epoch_auc > best_val_auc:
                 best_val_auc = epoch_auc
                 best_model_wts = model.state_dict().copy()
+                patience_counter = 0  # Reset patience counter
                 logging.info(f'New best validation AUC: {best_val_auc:.4f}')
-                torch.save(model.state_dict(), 'best_efficientnet_b7_raw_model.pth')
+                torch.save(model.state_dict(), 'best_efficientnet_b7_balanced_augmented.pth')
+            else:
+                patience_counter += 1
+                logging.info(f'No improvement for {patience_counter} epochs')
+                
+                # Early stopping
+                if patience_counter >= patience:
+                    logging.info(f'Early stopping triggered after epoch {epoch+1}')
+                    break
         else:
             logging.info(f'Val Loss: {epoch_loss:.4f} F1: {epoch_f1:.4f}')
         
@@ -234,7 +329,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
     
     return model, train_losses, val_losses, train_f1s, val_f1s
 
-# Evaluation function
+# Evaluation function with detailed metrics
 def evaluate_model(model, data_loader):
     model.eval()
     all_preds = []
@@ -259,6 +354,11 @@ def evaluate_model(model, data_loader):
     accuracy = accuracy_score(all_labels, all_preds)
     f1 = f1_score(all_labels, all_preds, average='weighted')
     
+    # Calculate sensitivity and specificity
+    tn, fp, fn, tp = cm.ravel()
+    sensitivity = tp / (tp + fn) if (tp + fn) > 0 else 0
+    specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
+    
     # AUC-ROC
     if len(np.unique(all_labels)) > 1:
         auc_roc = roc_auc_score(all_labels, all_probs)
@@ -272,6 +372,8 @@ def evaluate_model(model, data_loader):
     logging.info(f'Confusion Matrix:\n{cm}')
     logging.info(f'Accuracy: {accuracy:.4f}')
     logging.info(f'F1 Score: {f1:.4f}')
+    logging.info(f'Sensitivity: {sensitivity:.4f}')
+    logging.info(f'Specificity: {specificity:.4f}')
     logging.info(f'AUC-ROC: {auc_roc:.4f}')
     logging.info(f'AUC-PR: {auc_pr:.4f}')
     
@@ -296,8 +398,8 @@ def plot_training_history(train_loss, val_loss, train_f1, val_f1):
     ax2.legend()
     
     plt.tight_layout()
-    plt.savefig('training_history_b7_raw.png')
-    logging.info('Training history plot saved as training_history_b7_raw.png')
+    plt.savefig('training_history_b7_balanced_augmented.png')
+    logging.info('Training history plot saved as training_history_b7_balanced_augmented.png')
 
 def plot_confusion_matrix(cm, class_names):
     plt.figure(figsize=(8, 6))
@@ -306,8 +408,8 @@ def plot_confusion_matrix(cm, class_names):
     plt.ylabel('True Labels')
     plt.title('Confusion Matrix')
     plt.tight_layout()
-    plt.savefig('confusion_matrix_b7_raw.png')
-    logging.info('Confusion matrix plot saved as confusion_matrix_b7_raw.png')
+    plt.savefig('confusion_matrix_b7_balanced_augmented.png')
+    logging.info('Confusion matrix plot saved as confusion_matrix_b7_balanced_augmented.png')
 
 def plot_roc_curve(labels, probs):
     from sklearn.metrics import roc_curve
@@ -323,8 +425,8 @@ def plot_roc_curve(labels, probs):
     plt.title('Receiver Operating Characteristic')
     plt.legend(loc='lower right')
     plt.tight_layout()
-    plt.savefig('roc_curve_b7_raw.png')
-    logging.info('ROC curve plot saved as roc_curve_b7_raw.png')
+    plt.savefig('roc_curve_b7_balanced_augmented.png')
+    logging.info('ROC curve plot saved as roc_curve_b7_balanced_augmented.png')
 
 def plot_pr_curve(labels, probs):
     precision, recall, _ = precision_recall_curve(labels, probs)
@@ -338,11 +440,11 @@ def plot_pr_curve(labels, probs):
     plt.title('Precision-Recall Curve')
     plt.legend(loc='lower left')
     plt.tight_layout()
-    plt.savefig('pr_curve_b7_raw.png')
-    logging.info('Precision-Recall curve plot saved as pr_curve_b7_raw.png')
+    plt.savefig('pr_curve_b7_balanced_augmented.png')
+    logging.info('Precision-Recall curve plot saved as pr_curve_b7_balanced_augmented.png')
 
 def main():
-    logging.info("Starting raw cancer classification model training with EfficientNet B7")
+    logging.info("Starting balanced and augmented cancer classification model training with EfficientNet B7")
     
     # Verify if pretrained weights are available
     check_pretrained_weights()
@@ -351,25 +453,29 @@ def main():
     model = get_model()
     logging.info(f"Initialized EfficientNet B7 model with lukemelas pretrained weights")
     
-    # Define loss function without class weights
-    criterion = nn.CrossEntropyLoss()
+    # Calculate class weights for weighted loss
+    class_counts = np.bincount([label for _, label in train_dataset])
+    class_weights = 1. / torch.tensor(class_counts, dtype=torch.float)
+    class_weights = class_weights / class_weights.sum()
+    class_weights = class_weights.to(device)
     
-    # Define optimizer with weight decay
-    optimizer = optim.AdamW(
-        [
-            {'params': [p for n, p in model.named_parameters() if p.requires_grad and 'classifier' not in n], 'lr': LEARNING_RATE * 0.1},
-            {'params': model.classifier.parameters(), 'lr': LEARNING_RATE}
-        ],
-        weight_decay=WEIGHT_DECAY
-    )
+    # Define loss function with class weights
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    logging.info(f"Using weighted CrossEntropyLoss with weights: {class_weights.cpu().numpy()}")
+    
+    # Define optimizer with differential learning rates
+    optimizer = optim.AdamW([
+        {'params': [p for n, p in model.named_parameters() if p.requires_grad and 'classifier' not in n], 'lr': LEARNING_RATE * 0.1},
+        {'params': model.classifier.parameters(), 'lr': LEARNING_RATE}
+    ], weight_decay=WEIGHT_DECAY)
     
     # Learning rate scheduler
     scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS, eta_min=LEARNING_RATE * 0.01)
     
     # Train model
-    logging.info("Starting model training")
+    logging.info("Starting model training with balancing and augmentation")
     model, train_losses, val_losses, train_f1s, val_f1s = train_model(
-        model, train_loader, val_loader, criterion, optimizer, scheduler, NUM_EPOCHS
+        model, train_loader, val_loader, criterion, optimizer, scheduler, NUM_EPOCHS, patience=15
     )
     logging.info("Model training completed")
     
@@ -392,12 +498,62 @@ def main():
     torch.save({
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'classes': train_dataset.classes
-    }, 'final_efficientnet_b7_raw_model.pth')
-    logging.info("Model saved as final_efficientnet_b7_raw_model.pth")
+        'classes': train_dataset.classes,
+        'training_stats': {
+            'train_losses': train_losses,
+            'val_losses': val_losses,
+            'train_f1s': train_f1s,
+            'val_f1s': val_f1s
+        },
+        'test_metrics': {
+            'accuracy': accuracy,
+            'f1': f1,
+            'auc_roc': auc_roc,
+            'auc_pr': auc_pr
+        }
+    }, 'final_efficientnet_b7_balanced_augmented_model.pth')
+    logging.info("Model saved as final_efficientnet_b7_balanced_augmented_model.pth")
 
 if __name__ == "__main__":
     try:
         main()
     except Exception as e:
         logging.exception(f"An error occurred: {e}")
+        
+        
+        
+        
+        
+# 1. Undersampling of Majority Class (AC)
+
+# Added an undersampling strategy in the CancerDataset class that reduces the majority class (AC) to 40% of its original size
+# This undersampling is only applied to the training set, preserving the validation and test sets
+
+# 2. Data Augmentation
+# Added geometric transformations that preserve lesion features:
+
+# RandomResizedCrop (with scale 0.8-1.0 to maintain most of the lesion area)
+# RandomHorizontalFlip and RandomVerticalFlip
+# Moderate RandomRotation (15 degrees)
+# Subtle ColorJitter with minimal hue adjustments to preserve medical features
+
+# 3. Efficiency and Effectiveness Improvements
+
+# Mixed precision training using torch.cuda.amp for faster computation
+# Gradient clipping to prevent exploding gradients
+# Class-weighted loss function to further address class imbalance
+# Progressive unfreezing of EfficientNet layers
+# Improved model regularization with dropout in the classifier
+# Early stopping with patience parameter to prevent overfitting
+# Differential learning rates for feature extractor vs. classifier
+# Cosine annealing learning rate scheduler
+# Enhanced evaluation metrics including sensitivity and specificity
+# Improved logging with more detailed metrics
+
+# 4. Other Enhancements
+
+# Better file naming for logs and saved models
+# Expanded the model saving to include training statistics and test metrics
+# More informative visualization plots
+# Better error handling and seed setting for reproducibility
+

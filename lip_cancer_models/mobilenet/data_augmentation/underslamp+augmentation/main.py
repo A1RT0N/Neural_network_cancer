@@ -13,9 +13,9 @@ import seaborn as sns
 from PIL import Image
 from sklearn.metrics import confusion_matrix, f1_score, roc_auc_score, precision_recall_curve, auc
 
-# Configure logging
+# Set up logging
 logging.basicConfig(
-    filename='training_output_resnet152_balanced_augmented.log',
+    filename='training_output_mobilenet_v2_balanced_augmented.log',
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
@@ -29,19 +29,19 @@ random.seed(SEED)
 
 # General configurations
 DATA_DIR = "/home/Ayrton/Neural_network_cancer"
-BATCH_SIZE = 16
-INPUT_SIZE = 224  # ResNet-152 uses 224x224
+BATCH_SIZE = 32
+INPUT_SIZE = 224  # MobileNetV2 uses 224x224
 NUM_CLASSES = 2
 NUM_EPOCHS = 50
-LEARNING_RATE = 5e-5
+LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-5
 UNDERSAMPLE_RATIO = 0.4  # Keep 40% of majority class samples
 EARLY_STOPPING_PATIENCE = 15
-CHECKPOINT_DIR = os.path.join(DATA_DIR, 'checkpoints_resnet152_balanced_augmented')
+CHECKPOINT_DIR = os.path.join(DATA_DIR, 'checkpoints_mobilenet_v2_balanced_augmented')
 os.makedirs(CHECKPOINT_DIR, exist_ok=True)
 
-# Path to pre-downloaded weights
-PRETRAINED_WEIGHTS = "/home/Ayrton/.cache/torch/hub/checkpoints/resnet152-b121ed2d.pth"
+# Path to the pre-downloaded weights
+PRETRAINED_WEIGHTS = "/home/Ayrton/.cache/torch/hub/checkpoints/mobilenet_v2-b0353104.pth"
 
 # Check for GPU availability
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -142,11 +142,11 @@ def get_transforms(input_size, is_training=False):
             transforms.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
         ])
 
-# Enhanced ResNet152 classifier with improved fine-tuning and regularization
-class ResNet152Classifier(nn.Module):
+# Enhanced MobileNetV2 classifier with improved regularization
+class MobileNetV2Classifier(nn.Module):
     def __init__(self, num_classes=2, pretrained_path=None, dropout_rate=0.3):
-        super(ResNet152Classifier, self).__init__()
-        self.backbone = models.resnet152(pretrained=False)
+        super(MobileNetV2Classifier, self).__init__()
+        self.backbone = models.mobilenet_v2(pretrained=False)
         
         # Load pre-trained weights if available
         if pretrained_path and os.path.exists(pretrained_path):
@@ -157,22 +157,28 @@ class ResNet152Classifier(nn.Module):
         else:
             logging.warning(f"Pre-trained weights file not found at {pretrained_path}. Using random initialization.")
         
-        # First freeze all parameters
+        # Progressive freezing strategy - freeze early layers
+        # First freeze everything
         for param in self.backbone.parameters():
             param.requires_grad = False
         
-        # Progressive unfreezing strategy
-        # Unfreeze layer4 (last residual block) and fc
-        for name, param in self.backbone.named_parameters():
-            if name.startswith('layer4') or name.startswith('fc'):
-                param.requires_grad = True
-                
+        # Then selectively unfreeze later layers
+        # MobileNetV2 features has 18 blocks (0-17)
+        for i, block in enumerate(self.backbone.features):
+            if i >= 14:  # Only unfreeze last 4 blocks (adjust as needed)
+                for param in block.parameters():
+                    param.requires_grad = True
+        
         # Enhanced classifier with dropout for regularization
-        in_features = self.backbone.fc.in_features
-        self.backbone.fc = nn.Sequential(
+        in_features = self.backbone.classifier[1].in_features
+        self.backbone.classifier = nn.Sequential(
             nn.Dropout(dropout_rate),
             nn.Linear(in_features, num_classes)
         )
+        
+        # Make sure classifier parameters are trainable
+        for param in self.backbone.classifier.parameters():
+            param.requires_grad = True
         
         # Count trainable parameters
         trainable_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
@@ -183,7 +189,7 @@ class ResNet152Classifier(nn.Module):
         return self.backbone(x)
 
 # Function to load datasets with undersampling
-def load_data(data_dir, batch_size=16, input_size=224):
+def load_data(data_dir, batch_size=32, input_size=224):
     train_dir = os.path.join(data_dir, 'Training')
     val_dir = os.path.join(data_dir, 'Validation')
     test_dir = os.path.join(data_dir, 'Test')
@@ -466,7 +472,7 @@ def train_model(model, dataloaders, criterion, optimizer, scheduler=None, num_ep
                 'val_accs': val_accs,
                 'train_f1s': train_f1s,
                 'val_f1s': val_f1s
-            }, os.path.join(CHECKPOINT_DIR, 'best_resnet152_balanced_augmented_model.pth'))
+            }, os.path.join(CHECKPOINT_DIR, 'best_mobilenet_v2_balanced_augmented_model.pth'))
             
             logging.info(f"Saved new best model with F1 score: {best_val_f1:.4f}")
         else:
@@ -525,13 +531,13 @@ def plot_training_metrics(train_losses, val_losses, train_accs, val_accs, train_
 # Main function
 def main():
     try:
-        logging.info("Starting balanced and augmented cancer classification with ResNet-152")
+        logging.info("Starting balanced and augmented cancer classification with MobileNetV2")
         
         # Load data with undersampling and augmentation
         dataloaders, class_names, class_weights = load_data(DATA_DIR, BATCH_SIZE, INPUT_SIZE)
         
         # Create model with improved regularization
-        model = ResNet152Classifier(
+        model = MobileNetV2Classifier(
             num_classes=NUM_CLASSES, 
             pretrained_path=PRETRAINED_WEIGHTS,
             dropout_rate=0.3
@@ -545,9 +551,9 @@ def main():
         # Optimizer with differential learning rates
         optimizer = optim.AdamW([
             {'params': [param for name, param in model.named_parameters() 
-                       if not name.startswith('backbone.fc') and param.requires_grad], 
+                       if 'classifier' not in name and param.requires_grad], 
              'lr': LEARNING_RATE * 0.1},
-            {'params': model.backbone.fc.parameters(), 
+            {'params': model.backbone.classifier.parameters(), 
              'lr': LEARNING_RATE}
         ], weight_decay=WEIGHT_DECAY)
         
